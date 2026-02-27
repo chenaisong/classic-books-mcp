@@ -33,7 +33,8 @@
 	"kv_namespaces": [
 		{
 			"binding": "OAUTH_KV",
-			"id": "<ADD YOUR KV NAMESPACEID HERE>"
+			"id": "a0a585ce29d3485db7970d982f2ba4ab",
+			"remote": true
 		}
 	],
 	"observability": {
