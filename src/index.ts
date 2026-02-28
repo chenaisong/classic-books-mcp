@@ -35,7 +35,7 @@ async function fetchWithTimeout(
 	}
 }
 
-// ─── 安全 JSON 解析（防止 HTML 错误页导致崩溃）──────────────────────────────
+// ─── 安全 JSON 解析 ──────────────────────────────────────────────────────────
 async function safeJson(res: Response, sourceName: string): Promise<any> {
 	const text = await res.text();
 	try {
@@ -115,7 +115,7 @@ async function searchGutenberg(query: string, lang = "en", limit = 5) {
 	}));
 }
 
-// ─── Wikisource（多语言维基文库）────────────────────────────────────────────
+// ─── Wikisource 通用搜索（多语言）───────────────────────────────────────────
 async function searchWikisource(query: string, lang = "en", limit = 5) {
 	const url = `https://${lang}.wikisource.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srnamespace=0&srlimit=${limit}&format=json&origin=*`;
 	const res = await fetchWithTimeout(url);
@@ -128,6 +128,45 @@ async function searchWikisource(query: string, lang = "en", limit = 5) {
 		language: lang,
 		snippet: p.snippet?.replace(/<[^>]+>/g, "") || "",
 	}));
+}
+
+// ─── Wikisource 获取页面全文 ─────────────────────────────────────────────────
+async function getWikisourcePage(lang: string, pageid: string) {
+	const url = `https://${lang}.wikisource.org/w/api.php?action=query&pageids=${pageid}&prop=revisions&rvprop=content&rvslots=main&format=json&origin=*`;
+	const res = await fetchWithTimeout(url);
+	const data: any = await safeJson(res, "Wikisource");
+	if (data.error) return data;
+	const page = Object.values(data.query?.pages || {})[0] as any;
+	const wikitext = page?.revisions?.[0]?.slots?.main?.["*"] || "";
+	const clean = wikitext
+		.replace(/\[\[([^\]|]+\|)?([^\]]+)\]\]/g, "$2")
+		.replace(/\{\{[^}]+\}\}/g, "")
+		.replace(/==+([^=]+)==+/g, "\n\n$1\n")
+		.replace(/<[^>]+>/g, "")
+		.replace(/\[\[分類:[^\]]+\]\]/g, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+	return { title: page.title, pageid, content: clean };
+}
+
+// ─── Wikisource 中文版：按标题直接获取页面 ──────────────────────────────────
+async function getWikisourceZhByTitle(title: string) {
+	const url = `https://zh.wikisource.org/w/api.php?action=query&titles=${encodeURIComponent(title)}&prop=revisions&rvprop=content&rvslots=main&format=json&origin=*`;
+	const res = await fetchWithTimeout(url);
+	const data: any = await safeJson(res, "Wikisource zh");
+	if (data.error) return data;
+	const page = Object.values(data.query?.pages || {})[0] as any;
+	if (page?.missing !== undefined) return { error: `Page "${title}" not found on zh.wikisource.org` };
+	const wikitext = page?.revisions?.[0]?.slots?.main?.["*"] || "";
+	const clean = wikitext
+		.replace(/\[\[([^\]|]+\|)?([^\]]+)\]\]/g, "$2")
+		.replace(/\{\{[^}]+\}\}/g, "")
+		.replace(/==+([^=]+)==+/g, "\n\n$1\n")
+		.replace(/<[^>]+>/g, "")
+		.replace(/\[\[分類:[^\]]+\]\]/g, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+	return { title: page.title, pageid: page.pageid, content: clean, source: "wikisource_zh" };
 }
 
 // ─── OpenLibrary ─────────────────────────────────────────────────────────────
@@ -165,32 +204,6 @@ async function searchLibriVox(query: string, limit = 5) {
 		url_rss: b.url_rss,
 		url_zip_file: b.url_zip_file,
 	}));
-}
-
-// ─── ctext.org 中国哲学书电子化计划 ─────────────────────────────────────────
-const CTEXT_HEADERS = {
-	"User-Agent": "Mozilla/5.0 (compatible; ClassicBooksMCP/3.0)",
-	"Accept": "application/json",
-};
-
-async function searchCtext(query: string) {
-	const url = `https://ctext.org/api.pl?if=en&op=searchtexts&text=${encodeURIComponent(query)}&format=json`;
-	const res = await fetchWithTimeout(url, 8000, CTEXT_HEADERS);
-	const data: any = await safeJson(res, "ctext.org");
-	if (data.error) return [data];
-	return (data.results || []).map((r: any) => ({
-		source: "ctext",
-		id: `ctext:${r.urn}`,
-		title: r.title,
-		urn: r.urn,
-		description: r.description || "",
-	}));
-}
-
-async function getCtextChapter(urn: string) {
-	const url = `https://ctext.org/api.pl?if=en&op=gettext&urn=${encodeURIComponent(urn)}&format=json`;
-	const res = await fetchWithTimeout(url, 8000, CTEXT_HEADERS);
-	return safeJson(res, "ctext.org");
 }
 
 // ─── 今日诗词 ────────────────────────────────────────────────────────────────
@@ -281,33 +294,42 @@ const SACRED_TEXTS_CATALOG: Record<string, { title: string; url: string; traditi
 	],
 };
 
-// ─── 中国古籍目录 ─────────────────────────────────────────────────────────────
-const CHINESE_CLASSICS_CATALOG: Record<string, { title: string; urn: string; dynasty: string; genre: string }[]> = {
+// ─── 中国古籍目录（含 Wikisource zh 标题）───────────────────────────────────
+const CHINESE_CLASSICS_CATALOG: Record<string, {
+	title: string; ws_title: string; dynasty: string; genre: string; description: string
+}[]> = {
 	philosophy: [
-		{ title: "论语", urn: "ctp:analects", dynasty: "春秋", genre: "儒家" },
-		{ title: "道德经", urn: "ctp:dao-de-jing", dynasty: "春秋", genre: "道家" },
-		{ title: "庄子", urn: "ctp:zhuangzi", dynasty: "战国", genre: "道家" },
-		{ title: "孟子", urn: "ctp:mengzi", dynasty: "战国", genre: "儒家" },
-		{ title: "荀子", urn: "ctp:xunzi", dynasty: "战国", genre: "儒家" },
-		{ title: "韩非子", urn: "ctp:hanfeizi", dynasty: "战国", genre: "法家" },
-		{ title: "墨子", urn: "ctp:mozi", dynasty: "战国", genre: "墨家" },
-		{ title: "孙子兵法", urn: "ctp:sunzi", dynasty: "春秋", genre: "兵家" },
+		{ title: "论语", ws_title: "論語", dynasty: "春秋", genre: "儒家", description: "孔子及其弟子言行录，儒家核心经典" },
+		{ title: "道德经", ws_title: "道德經", dynasty: "春秋", genre: "道家", description: "老子著，道家哲学根本典籍" },
+		{ title: "庄子", ws_title: "莊子", dynasty: "战国", genre: "道家", description: "庄周著，道家哲学代表作" },
+		{ title: "孟子", ws_title: "孟子", dynasty: "战国", genre: "儒家", description: "孟子言论集，儒家四书之一" },
+		{ title: "荀子", ws_title: "荀子", dynasty: "战国", genre: "儒家", description: "荀况著，儒家重要典籍" },
+		{ title: "韩非子", ws_title: "韓非子", dynasty: "战国", genre: "法家", description: "韩非著，法家集大成之作" },
+		{ title: "墨子", ws_title: "墨子", dynasty: "战国", genre: "墨家", description: "墨翟著，兼爱非攻思想" },
+		{ title: "孙子兵法", ws_title: "孫子兵法", dynasty: "春秋", genre: "兵家", description: "孙武著，世界最早兵书" },
 	],
 	history: [
-		{ title: "史记", urn: "ctp:shiji", dynasty: "西汉", genre: "纪传体史书" },
-		{ title: "汉书", urn: "ctp:hanshu", dynasty: "东汉", genre: "纪传体史书" },
-		{ title: "资治通鉴", urn: "ctp:zizhi-tongjian", dynasty: "北宋", genre: "编年体史书" },
+		{ title: "史记", ws_title: "史記", dynasty: "西汉", genre: "纪传体史书", description: "司马迁著，中国第一部纪传体通史" },
+		{ title: "汉书", ws_title: "漢書", dynasty: "东汉", genre: "纪传体史书", description: "班固著，第一部断代史" },
+		{ title: "资治通鉴", ws_title: "資治通鑑", dynasty: "北宋", genre: "编年体史书", description: "司马光著，编年体通史巨著" },
+		{ title: "三国志", ws_title: "三國志", dynasty: "西晋", genre: "纪传体史书", description: "陈寿著，记载三国历史" },
 	],
 	poetry: [
-		{ title: "诗经", urn: "ctp:shijing", dynasty: "西周至春秋", genre: "诗歌总集" },
-		{ title: "楚辞", urn: "ctp:chuci", dynasty: "战国", genre: "楚辞" },
-		{ title: "全唐诗（节选）", urn: "ctp:quantangshi", dynasty: "唐", genre: "唐诗" },
+		{ title: "诗经", ws_title: "詩經", dynasty: "西周至春秋", genre: "诗歌总集", description: "中国最早诗歌总集，共305篇" },
+		{ title: "楚辞", ws_title: "楚辭", dynasty: "战国", genre: "楚辞", description: "屈原等人作品，浪漫主义源头" },
+		{ title: "古诗十九首", ws_title: "古詩十九首", dynasty: "东汉", genre: "五言诗", description: "汉代无名氏诗作，五言诗典范" },
 	],
 	classics: [
-		{ title: "易经", urn: "ctp:yijing", dynasty: "西周", genre: "经部" },
-		{ title: "礼记", urn: "ctp:liji", dynasty: "西汉", genre: "经部" },
-		{ title: "大学", urn: "ctp:daxue", dynasty: "先秦", genre: "儒家" },
-		{ title: "中庸", urn: "ctp:zhongyong", dynasty: "先秦", genre: "儒家" },
+		{ title: "易经", ws_title: "易經", dynasty: "西周", genre: "经部", description: "六经之首，中国哲学根源" },
+		{ title: "礼记", ws_title: "禮記", dynasty: "西汉", genre: "经部", description: "儒家礼仪制度汇编" },
+		{ title: "大学", ws_title: "大學", dynasty: "先秦", genre: "儒家", description: "儒家四书之一，修身齐家治国之道" },
+		{ title: "中庸", ws_title: "中庸", dynasty: "先秦", genre: "儒家", description: "儒家四书之一，中和之道" },
+	],
+	novels: [
+		{ title: "红楼梦", ws_title: "紅樓夢", dynasty: "清", genre: "章回小说", description: "曹雪芹著，中国古典小说巅峰" },
+		{ title: "三国演义", ws_title: "三國演義", dynasty: "元末明初", genre: "章回小说", description: "罗贯中著，历史演义小说" },
+		{ title: "水浒传", ws_title: "水滸傳", dynasty: "元末明初", genre: "章回小说", description: "施耐庵著，英雄传奇小说" },
+		{ title: "西游记", ws_title: "西遊記", dynasty: "明", genre: "章回小说", description: "吴承恩著，神魔小说代表作" },
 	],
 };
 
@@ -334,15 +356,15 @@ const JAPANESE_CLASSICS_CATALOG: { title: string; author: string; book_id: numbe
 ];
 
 // ─── 韩国古典目录 ────────────────────────────────────────────────────────────
-const KOREAN_CLASSICS_CATALOG: { title: string; title_ko: string; lang: string; era: string; description: string }[] = [
-	{ title: "三国遗事 (삼국유사)", title_ko: "삼국유사", lang: "ko", era: "高丽 13世纪", description: "朝鲜半岛最古老的历史与神话集" },
-	{ title: "三国史记 (삼국사기)", title_ko: "삼국사기", lang: "ko", era: "高丽 12世纪", description: "朝鲜最古老的官修正史" },
-	{ title: "春香传 (춘향전)", title_ko: "춘향전", lang: "ko", era: "朝鲜 18世纪", description: "最具代表性的朝鲜古典爱情小说" },
-	{ title: "洪吉童传 (홍길동전)", title_ko: "홍길동전", lang: "ko", era: "朝鲜 17世纪", description: "第一部用韩文写成的小说" },
-	{ title: "九云梦 (구운몽)", title_ko: "구운몽", lang: "ko", era: "朝鲜 17世纪", description: "朝鲜古典浪漫主义小说" },
-	{ title: "沈清传 (심청전)", title_ko: "심청전", lang: "ko", era: "朝鲜时代", description: "以孝道为主题的朝鲜古典故事" },
-	{ title: "兴夫传 (흥부전)", title_ko: "흥부전", lang: "ko", era: "朝鲜时代", description: "善恶有报的朝鲜民间故事" },
-	{ title: "龟兔传 (토끼전)", title_ko: "토끼전", lang: "ko", era: "朝鲜时代", description: "朝鲜寓言故事，来自佛典本生谭" },
+const KOREAN_CLASSICS_CATALOG: { title: string; title_ko: string; era: string; description: string }[] = [
+	{ title: "三国遗事 (삼국유사)", title_ko: "삼국유사", era: "高丽 13世纪", description: "朝鲜半岛最古老的历史与神话集" },
+	{ title: "三国史记 (삼국사기)", title_ko: "삼국사기", era: "高丽 12世纪", description: "朝鲜最古老的官修正史" },
+	{ title: "春香传 (춘향전)", title_ko: "춘향전", era: "朝鲜 18世纪", description: "最具代表性的朝鲜古典爱情小说" },
+	{ title: "洪吉童传 (홍길동전)", title_ko: "홍길동전", era: "朝鲜 17世纪", description: "第一部用韩文写成的小说" },
+	{ title: "九云梦 (구운몽)", title_ko: "구운몽", era: "朝鲜 17世纪", description: "朝鲜古典浪漫主义小说" },
+	{ title: "沈清传 (심청전)", title_ko: "심청전", era: "朝鲜时代", description: "以孝道为主题的朝鲜古典故事" },
+	{ title: "兴夫传 (흥부전)", title_ko: "흥부전", era: "朝鲜时代", description: "善恶有报的朝鲜民间故事" },
+	{ title: "龟兔传 (토끼전)", title_ko: "토끼전", era: "朝鲜时代", description: "朝鲜寓言故事，来自佛典本生谭" },
 ];
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -351,7 +373,7 @@ const KOREAN_CLASSICS_CATALOG: { title: string; title_ko: string; lang: string; 
 export class MyMCP extends McpAgent {
 	server = new McpServer({
 		name: "Classic Books & Sacred Texts",
-		version: "3.1.0",
+		version: "3.2.0",
 	});
 
 	async init() {
@@ -425,18 +447,9 @@ export class MyMCP extends McpAgent {
 
 				if (source === "wikisource") {
 					const [lang, pageid] = rest;
-					const url = `https://${lang}.wikisource.org/w/api.php?action=query&pageids=${pageid}&prop=revisions&rvprop=content&rvslots=main&format=json&origin=*`;
-					const res = await fetchWithTimeout(url);
-					const data: any = await safeJson(res, "Wikisource");
-					if (data.error) return { content: [{ type: "text", text: JSON.stringify(data) }] };
-					const page = Object.values(data.query?.pages || {})[0] as any;
-					const wikitext = page?.revisions?.[0]?.slots?.main?.["*"] || "";
-					const clean = wikitext
-						.replace(/\[\[([^\]|]+\|)?([^\]]+)\]\]/g, "$2")
-						.replace(/\{\{[^}]+\}\}/g, "")
-						.replace(/==([^=]+)==/g, "\n\n$1\n")
-						.slice(0, 15000);
-					const result = { source: "wikisource", lang, pageid, title: page.title, content: clean, chapter };
+					const page = await getWikisourcePage(lang, pageid);
+					if (page.error) return { content: [{ type: "text", text: JSON.stringify(page) }] };
+					const result = { source: "wikisource", lang, ...page, chapter };
 					setCache(cacheKey, result);
 					return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 				}
@@ -500,37 +513,61 @@ export class MyMCP extends McpAgent {
 			}
 		);
 
-		// ── 工具6：搜索中国古籍（ctext）─────────────────────────────────────────
+		// ── 工具6：搜索中国古籍（Wikisource zh）─────────────────────────────────
 		this.server.tool(
 			"search_chinese_classics",
-			"Search Chinese classical texts from the Chinese Text Project (ctext.org). Covers pre-Qin, Han dynasty philosophy, Confucianism, Taoism, history, poetry and more.",
+			"Search Chinese classical texts from Wikisource (zh.wikisource.org). Covers Four Books, Five Classics, histories, poetry, and the four great novels.",
 			{
-				query: z.string().describe("Search term in Chinese or English, e.g. '论语', 'analects', '道德经'"),
+				query: z.string().describe("Search term in Chinese, e.g. '论语', '道德经', '红楼梦', '史记'"),
+				limit: z.number().default(5).describe("Max results to return"),
 			},
-			async ({ query }) => {
-				const cacheKey = `ctext:search:${query}`;
+			async ({ query, limit }) => {
+				const cacheKey = `zh_ws:search:${query}`;
 				const cached = getCache(cacheKey);
 				if (cached) return { content: [{ type: "text", text: JSON.stringify(cached, null, 2) }] };
-				const data = await searchCtext(query);
-				const response = { query, source: "ctext.org", total: data.length, results: data };
+
+				const results = await searchWikisource(query, "zh", limit);
+				const response = {
+					query,
+					source: "zh.wikisource.org",
+					total: results.length,
+					tip: "Use get_chinese_classic_chapter with the id field to read full text",
+					results,
+				};
 				setCache(cacheKey, response);
 				return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
 			}
 		);
 
-		// ── 工具7：获取中国古籍章节（ctext URN）─────────────────────────────────
+		// ── 工具7：获取中国古籍内容（Wikisource zh，支持标题直查）───────────────
 		this.server.tool(
 			"get_chinese_classic_chapter",
-			"Get chapter content from Chinese Text Project using a URN. Use browse_chinese_classics to find URNs. Example URNs: ctp:analects/xue-er, ctp:dao-de-jing, ctp:sunzi",
+			"Get content of a Chinese classic from Wikisource. Can use id from search_chinese_classics, or directly pass a title like '論語', '道德經', '孫子兵法'.",
 			{
-				urn: z.string().describe("CTP URN, e.g. 'ctp:analects/xue-er', 'ctp:dao-de-jing', 'ctp:shiji/benji'"),
+				id: z.string().optional().describe("wikisource id from search results, e.g. 'wikisource:zh:12345'"),
+				title: z.string().optional().describe("Traditional Chinese title to look up directly, e.g. '論語', '道德經', '孫子兵法', '史記'"),
 			},
-			async ({ urn }) => {
-				const cacheKey = `ctext:chapter:${urn}`;
+			async ({ id, title }) => {
+				if (!id && !title) {
+					return { content: [{ type: "text", text: "Please provide either id or title parameter" }] };
+				}
+
+				const cacheKey = `zh_ws:chapter:${id || title}`;
 				const cached = getCache(cacheKey, 600_000);
 				if (cached) return { content: [{ type: "text", text: JSON.stringify(cached, null, 2) }] };
-				const data: any = await getCtextChapter(urn);
-				const result = { source: "ctext.org", urn, ...data };
+
+				let result: any;
+
+				if (id) {
+					const parts = id.split(":");
+					const pageid = parts[2];
+					result = await getWikisourcePage("zh", pageid);
+				} else if (title) {
+					result = await getWikisourceZhByTitle(title);
+				}
+
+				if (result.error) return { content: [{ type: "text", text: JSON.stringify(result) }] };
+
 				setCache(cacheKey, result);
 				return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 			}
@@ -539,11 +576,11 @@ export class MyMCP extends McpAgent {
 		// ── 工具8：浏览中国古典名著目录 ─────────────────────────────────────────
 		this.server.tool(
 			"browse_chinese_classics",
-			"Browse curated catalog of Chinese classical texts with URNs for use with get_chinese_classic_chapter.",
+			"Browse curated catalog of Chinese classical texts. Each entry includes a ws_title (traditional Chinese) for use with get_chinese_classic_chapter.",
 			{
-				category: z.enum(["all", "philosophy", "history", "poetry", "classics"])
+				category: z.enum(["all", "philosophy", "history", "poetry", "classics", "novels"])
 					.default("all")
-					.describe("Category: philosophy(诸子百家), history(史书), poetry(诗词), classics(经部)"),
+					.describe("Category: philosophy(诸子百家), history(史书), poetry(诗词), classics(经部), novels(四大名著)"),
 			},
 			async ({ category }) => {
 				const catalog = category === "all"
@@ -618,11 +655,10 @@ export class MyMCP extends McpAgent {
 				const result = await getAozoraText(id);
 				if (!result) return { content: [{ type: "text", text: "Text not available for this book. Check the book_id is correct." }] };
 
-				// 清理青空文庫特有格式注释
 				const cleaned = result.text
-					.replace(/［＃[^\]]*］/g, "")   // 移除格式注释
-					.replace(/《[^》]*》/g, "")      // 移除振假名
-					.replace(/｜/g, "");             // 移除分隔符
+					.replace(/［＃[^\]]*］/g, "")
+					.replace(/《[^》]*》/g, "")
+					.replace(/｜/g, "");
 
 				const chapterData = extractChapter(cleaned, chapter);
 				const response = {
