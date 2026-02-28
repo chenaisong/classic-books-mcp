@@ -20,14 +20,32 @@ function setCache(key: string, data: any) {
 	cache.set(key, { data, ts: Date.now() });
 }
 
-// ─── 通用 fetch with timeout ─────────────────────────────────────────────────
-async function fetchWithTimeout(url: string, ms = 8000): Promise<Response> {
+// ─── 通用 fetch with timeout + headers ──────────────────────────────────────
+async function fetchWithTimeout(
+	url: string,
+	ms = 8000,
+	headers: Record<string, string> = {}
+): Promise<Response> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), ms);
 	try {
-		return await fetch(url, { signal: controller.signal });
+		return await fetch(url, { signal: controller.signal, headers });
 	} finally {
 		clearTimeout(timer);
+	}
+}
+
+// ─── 安全 JSON 解析（防止 HTML 错误页导致崩溃）──────────────────────────────
+async function safeJson(res: Response, sourceName: string): Promise<any> {
+	const text = await res.text();
+	try {
+		return JSON.parse(text);
+	} catch {
+		return {
+			error: `${sourceName} returned non-JSON response`,
+			hint: "The API may be temporarily unavailable or blocking this request",
+			preview: text.slice(0, 300),
+		};
 	}
 }
 
@@ -83,7 +101,8 @@ function extractChapter(text: string, chapterNum: number) {
 async function searchGutenberg(query: string, lang = "en", limit = 5) {
 	const url = `https://gutendex.com/books/?search=${encodeURIComponent(query)}&languages=${lang}&mime_type=text`;
 	const res = await fetchWithTimeout(url);
-	const data: any = await res.json();
+	const data: any = await safeJson(res, "Gutenberg");
+	if (data.error) return [data];
 	return (data.results || []).slice(0, limit).map((b: any) => ({
 		source: "gutenberg",
 		id: `gutenberg:${b.id}`,
@@ -100,7 +119,8 @@ async function searchGutenberg(query: string, lang = "en", limit = 5) {
 async function searchWikisource(query: string, lang = "en", limit = 5) {
 	const url = `https://${lang}.wikisource.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srnamespace=0&srlimit=${limit}&format=json&origin=*`;
 	const res = await fetchWithTimeout(url);
-	const data: any = await res.json();
+	const data: any = await safeJson(res, "Wikisource");
+	if (data.error) return [data];
 	return (data.query?.search || []).map((p: any) => ({
 		source: "wikisource",
 		id: `wikisource:${lang}:${p.pageid}`,
@@ -114,7 +134,8 @@ async function searchWikisource(query: string, lang = "en", limit = 5) {
 async function searchOpenLibrary(query: string, limit = 5) {
 	const url = `https://openlibrary.org/search.json?q=${encodeURIComponent(query)}&limit=${limit}&fields=key,title,author_name,first_publish_year,subject,language,cover_i`;
 	const res = await fetchWithTimeout(url);
-	const data: any = await res.json();
+	const data: any = await safeJson(res, "OpenLibrary");
+	if (data.error) return [data];
 	return (data.docs || []).map((b: any) => ({
 		source: "openlibrary",
 		id: `openlibrary:${b.key}`,
@@ -131,7 +152,8 @@ async function searchOpenLibrary(query: string, limit = 5) {
 async function searchLibriVox(query: string, limit = 5) {
 	const url = `https://librivox.org/api/feed/audiobooks/?title=${encodeURIComponent(query)}&format=json&limit=${limit}`;
 	const res = await fetchWithTimeout(url);
-	const data: any = await res.json();
+	const data: any = await safeJson(res, "LibriVox");
+	if (data.error) return [];
 	return (data.books || []).map((b: any) => ({
 		source: "librivox",
 		id: `librivox:${b.id}`,
@@ -146,10 +168,16 @@ async function searchLibriVox(query: string, limit = 5) {
 }
 
 // ─── ctext.org 中国哲学书电子化计划 ─────────────────────────────────────────
+const CTEXT_HEADERS = {
+	"User-Agent": "Mozilla/5.0 (compatible; ClassicBooksMCP/3.0)",
+	"Accept": "application/json",
+};
+
 async function searchCtext(query: string) {
 	const url = `https://ctext.org/api.pl?if=en&op=searchtexts&text=${encodeURIComponent(query)}&format=json`;
-	const res = await fetchWithTimeout(url);
-	const data: any = await res.json();
+	const res = await fetchWithTimeout(url, 8000, CTEXT_HEADERS);
+	const data: any = await safeJson(res, "ctext.org");
+	if (data.error) return [data];
 	return (data.results || []).map((r: any) => ({
 		source: "ctext",
 		id: `ctext:${r.urn}`,
@@ -161,21 +189,22 @@ async function searchCtext(query: string) {
 
 async function getCtextChapter(urn: string) {
 	const url = `https://ctext.org/api.pl?if=en&op=gettext&urn=${encodeURIComponent(urn)}&format=json`;
-	const res = await fetchWithTimeout(url);
-	return res.json();
+	const res = await fetchWithTimeout(url, 8000, CTEXT_HEADERS);
+	return safeJson(res, "ctext.org");
 }
 
 // ─── 今日诗词 ────────────────────────────────────────────────────────────────
 async function getDailyPoem() {
 	const res = await fetchWithTimeout("https://v1.jinrishici.com/all.json");
-	return res.json();
+	return safeJson(res, "jinrishici");
 }
 
 // ─── 青空文庫（Aozora Bunko）────────────────────────────────────────────────
 async function searchAozora(query: string, limit = 5) {
 	const url = `https://pubapi.aozorahack.org/books?title=${encodeURIComponent(query)}`;
 	const res = await fetchWithTimeout(url);
-	const data: any = await res.json();
+	const data: any = await safeJson(res, "Aozora Bunko");
+	if (data.error) return [data];
 	return (Array.isArray(data) ? data : []).slice(0, limit).map((b: any) => ({
 		source: "aozora",
 		id: `aozora:${b.book_id}`,
@@ -188,11 +217,10 @@ async function searchAozora(query: string, limit = 5) {
 
 async function getAozoraText(book_id: string) {
 	const res = await fetchWithTimeout(`https://pubapi.aozorahack.org/book/${book_id}`);
-	const meta: any = await res.json();
-	if (!meta.text_url) return null;
+	const meta: any = await safeJson(res, "Aozora Bunko");
+	if (meta.error || !meta.text_url) return null;
 	const textRes = await fetchWithTimeout(meta.text_url);
 	const buffer = await textRes.arrayBuffer();
-	// 青空文库使用 Shift-JIS 编码
 	const decoder = new TextDecoder("shift-jis");
 	return { meta, text: decoder.decode(buffer) };
 }
@@ -285,24 +313,19 @@ const CHINESE_CLASSICS_CATALOG: Record<string, { title: string; urn: string; dyn
 
 // ─── 日本名著目录（青空文庫 book_id）────────────────────────────────────────
 const JAPANESE_CLASSICS_CATALOG: { title: string; author: string; book_id: number; era: string; genre: string }[] = [
-	// 平安時代
 	{ title: "源氏物語", author: "紫式部", book_id: 5162, era: "平安", genre: "物語" },
 	{ title: "枕草子", author: "清少納言", book_id: 4383, era: "平安", genre: "随筆" },
 	{ title: "竹取物語", author: "不詳", book_id: 4231, era: "平安", genre: "物語" },
 	{ title: "伊勢物語", author: "不詳", book_id: 4073, era: "平安", genre: "歌物語" },
-	// 江戸時代
 	{ title: "奥の細道", author: "松尾芭蕉", book_id: 2310, era: "江戸", genre: "俳諧紀行" },
-	// 明治時代
 	{ title: "吾輩は猫である", author: "夏目漱石", book_id: 789, era: "明治", genre: "小説" },
 	{ title: "坊っちゃん", author: "夏目漱石", book_id: 790, era: "明治", genre: "小説" },
 	{ title: "こころ", author: "夏目漱石", book_id: 773, era: "明治", genre: "小説" },
 	{ title: "舞姫", author: "森鴎外", book_id: 684, era: "明治", genre: "小説" },
-	// 大正時代
 	{ title: "羅生門", author: "芥川龍之介", book_id: 127, era: "大正", genre: "短編小説" },
 	{ title: "蜘蛛の糸", author: "芥川龍之介", book_id: 92, era: "大正", genre: "短編小説" },
 	{ title: "鼻", author: "芥川龍之介", book_id: 130, era: "大正", genre: "短編小説" },
 	{ title: "藪の中", author: "芥川龍之介", book_id: 177, era: "大正", genre: "短編小説" },
-	// 昭和時代
 	{ title: "走れメロス", author: "太宰治", book_id: 1567, era: "昭和", genre: "短編小説" },
 	{ title: "人間失格", author: "太宰治", book_id: 301, era: "昭和", genre: "小説" },
 	{ title: "斜陽", author: "太宰治", book_id: 1569, era: "昭和", genre: "小説" },
@@ -328,7 +351,7 @@ const KOREAN_CLASSICS_CATALOG: { title: string; title_ko: string; lang: string; 
 export class MyMCP extends McpAgent {
 	server = new McpServer({
 		name: "Classic Books & Sacred Texts",
-		version: "3.0.0",
+		version: "3.1.0",
 	});
 
 	async init() {
@@ -384,10 +407,10 @@ export class MyMCP extends McpAgent {
 				if (source === "gutenberg") {
 					const id = rest[0];
 					const metaRes = await fetchWithTimeout(`https://gutendex.com/books/${id}`);
-					if (!metaRes.ok) return { content: [{ type: "text", text: "Book not found" }] };
-					const meta: any = await metaRes.json();
+					const meta: any = await safeJson(metaRes, "Gutenberg");
+					if (meta.error) return { content: [{ type: "text", text: JSON.stringify(meta) }] };
 					const textUrl = meta.formats["text/plain; charset=utf-8"] || meta.formats["text/plain"];
-					if (!textUrl) return { content: [{ type: "text", text: "No plain text available" }] };
+					if (!textUrl) return { content: [{ type: "text", text: "No plain text available for this book" }] };
 					const fullText = await (await fetchWithTimeout(textUrl)).text();
 					const chapterData = extractChapter(fullText, chapter);
 					const result = {
@@ -404,7 +427,8 @@ export class MyMCP extends McpAgent {
 					const [lang, pageid] = rest;
 					const url = `https://${lang}.wikisource.org/w/api.php?action=query&pageids=${pageid}&prop=revisions&rvprop=content&rvslots=main&format=json&origin=*`;
 					const res = await fetchWithTimeout(url);
-					const data: any = await res.json();
+					const data: any = await safeJson(res, "Wikisource");
+					if (data.error) return { content: [{ type: "text", text: JSON.stringify(data) }] };
 					const page = Object.values(data.query?.pages || {})[0] as any;
 					const wikitext = page?.revisions?.[0]?.slots?.main?.["*"] || "";
 					const clean = wikitext
@@ -497,7 +521,7 @@ export class MyMCP extends McpAgent {
 		// ── 工具7：获取中国古籍章节（ctext URN）─────────────────────────────────
 		this.server.tool(
 			"get_chinese_classic_chapter",
-			"Get chapter content from Chinese Text Project using a URN. Use browse_chinese_classics to find URNs.",
+			"Get chapter content from Chinese Text Project using a URN. Use browse_chinese_classics to find URNs. Example URNs: ctp:analects/xue-er, ctp:dao-de-jing, ctp:sunzi",
 			{
 				urn: z.string().describe("CTP URN, e.g. 'ctp:analects/xue-er', 'ctp:dao-de-jing', 'ctp:shiji/benji'"),
 			},
@@ -536,6 +560,7 @@ export class MyMCP extends McpAgent {
 			{},
 			async () => {
 				const data: any = await getDailyPoem();
+				if (data.error) return { content: [{ type: "text", text: JSON.stringify(data) }] };
 				return {
 					content: [{
 						type: "text",
@@ -591,7 +616,7 @@ export class MyMCP extends McpAgent {
 				if (cached) return { content: [{ type: "text", text: JSON.stringify(cached, null, 2) }] };
 
 				const result = await getAozoraText(id);
-				if (!result) return { content: [{ type: "text", text: "Text not available for this book" }] };
+				if (!result) return { content: [{ type: "text", text: "Text not available for this book. Check the book_id is correct." }] };
 
 				// 清理青空文庫特有格式注释
 				const cleaned = result.text
