@@ -39,10 +39,6 @@
 	],
 	"observability": {
 		"enabled": true
-	},
-	"assets": {
-		"directory": "./static/",
-		"binding": "ASSETS"
 	}
 	/**
 	 * Smart Placement
